@@ -1,0 +1,45 @@
+name: Key Recovery
+
+# Manual trigger only - for recovering encryption key on new devices
+on:
+  workflow_dispatch:
+
+jobs:
+  recover-key:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Encrypt key with PIN
+        run: |
+          # Use pbj's internal encryption command
+          # This encrypts PBJ_KEY with the user's PIN
+          cd "$GITHUB_WORKSPACE"
+          ./bin/pbj __internal_encrypt_for_recovery__
+        env:
+          PBJ_KEY: ${{ secrets.PBJ_KEY }}
+          PBJ_PIN: ${{ secrets.PBJ_PIN }}
+
+      - name: Display recovery instructions
+        run: |
+          echo ""
+          echo "============================================"
+          echo "RECOVERY INSTRUCTIONS"
+          echo "============================================"
+          echo ""
+          echo "On your new device, run:"
+          echo "  pbj recover"
+          echo ""
+          echo "You will be prompted for your PIN."
+          echo "The encrypted key is shown above."
+          echo ""
+          echo "============================================"
+          echo "SECURITY REMINDER"
+          echo "============================================"
+          echo "Delete this workflow run after recovery:"
+          echo "  gh run delete \$RUN_ID -R \$REPO"
+          echo ""
+          echo "Or via GitHub web interface:"
+          echo "  Settings → Actions → Workflow runs"
+          echo "============================================"

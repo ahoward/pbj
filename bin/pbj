@@ -1,0 +1,1269 @@
+#!/usr/bin/env ruby
+
+require 'openssl'
+require 'json'
+require 'fileutils'
+require 'time'
+require 'io/console'
+
+class PBJ
+  # Calculate paths relative to this script's location
+  # This allows cloning anywhere, not just ~/.pbj
+  SCRIPT_PATH = File.realpath(__FILE__)              # /path/to/clone/bin/pbj
+  BIN_DIR = File.dirname(SCRIPT_PATH)                # /path/to/clone/bin
+  REPO_DIR = File.dirname(BIN_DIR)                   # /path/to/clone
+  DATA_DIR = File.join(REPO_DIR, 'data')             # /path/to/clone/data
+  MANIFEST = File.join(DATA_DIR, 'manifest.json')
+
+  CHUNK_SIZE = 10 * 1024 * 1024 # 10MB chunks for generous free tier
+  REPO_NAME = 'pbj'  # Users fork ahoward/pbj to username/pbj
+  SECRET_NAME = 'PBJ_KEY'  # GitHub Secret (secure but not readable directly)
+
+  # History management
+  MAX_HISTORY_COMMITS = 108       # Keep last 108 clipboard entries
+  REPO_SIZE_WARNING_MB = 420      # Warn at 420MB
+  AUTO_PRUNE_THRESHOLD_MB = 4242  # Auto-prune at 4242MB
+
+  # PIN-protected key recovery
+  # SECURITY: PIN padding for split-key encryption
+  # This value is PERMANENT - changing it breaks all existing encrypted recovery logs
+  # Combined with user's 4-digit PIN to create 32-byte encryption key
+  # PIN (4 bytes) + PIN_PADDING (28 bytes) = 32 bytes for AES-256
+  PIN_PADDING_B64 = "XJv3x5LT080xr0zjLgzaAS/UvSfSJigSZUD7Ug=="
+  PIN_PADDING = PIN_PADDING_B64.unpack1('m0').freeze
+  PIN_SECRET_NAME = 'PBJ_PIN'  # GitHub Secret for user's PIN
+
+  class Error < StandardError; end
+  class SetupError < Error; end
+  class EncryptionError < Error; end
+  class DecryptionError < Error; end
+  class GitError < Error; end
+  class HistoryError < Error; end
+
+  def initialize
+    setup_repo unless File.directory?(REPO_DIR)
+  rescue => e
+    abort "✗ Setup failed: #{e.message}"
+  end
+
+  def copy(input = STDIN)
+    data = input.read
+    raise Error, "No data to copy" if data.empty?
+
+    key = get_or_create_key
+    raise EncryptionError, "Failed to obtain encryption key" unless key
+
+    # Encrypt
+    encrypted = encrypt(data, key)
+
+    # Chunk
+    chunks = chunk_data(encrypted)
+
+    # Write chunks
+    FileUtils.mkdir_p(DATA_DIR)
+    cleanup_old_chunks
+
+    chunks.each_with_index do |chunk, i|
+      File.binwrite(File.join(DATA_DIR, "clip.#{i.to_s.rjust(4, '0')}.enc"), chunk)
+    end
+
+    # Write manifest with key fingerprint
+    manifest = {
+      timestamp: Time.now.to_i,
+      chunks: chunks.size,
+      total_size: encrypted.bytesize,
+      preview: generate_preview(data),
+      key_fingerprint: key_fingerprint(key)
+    }
+    File.write(MANIFEST, JSON.pretty_generate(manifest))
+
+    # Git commit and push (with background auto-prune check)
+    sync_to_remote("update clipboard #{manifest[:timestamp]}")
+
+    STDERR.puts "✓ Copied #{data.bytesize} bytes (#{chunks.size} chunks)"
+
+    # Background tasks: prune check + key backup
+    background_prune_check
+    background_key_backup(key)
+  rescue Error => e
+    abort "✗ Copy failed: #{e.message}"
+  rescue => e
+    abort "✗ Unexpected error: #{e.message}\n#{e.backtrace.first(3).join("\n")}"
+  end
+
+  def paste(output = STDOUT, commit_hash = nil)
+    # Pull latest if no specific commit requested
+    pull_from_remote unless commit_hash
+
+    if commit_hash
+      # Checkout specific commit
+      restore_from_history(commit_hash)
+    end
+
+    raise Error, "No clipboard data found" unless File.exist?(MANIFEST)
+
+    manifest = JSON.parse(File.read(MANIFEST))
+    key = get_or_create_key
+    raise DecryptionError, "Failed to obtain encryption key" unless key
+
+    # Check for key mismatch (data encrypted with different key)
+    if manifest['key_fingerprint']
+      current_fingerprint = key_fingerprint(key)
+      if manifest['key_fingerprint'] != current_fingerprint
+        handle_key_mismatch(manifest)
+        raise Error, "Key mismatch detected - data cleared. Try copying something new."
+      end
+    end
+
+    # Verify all chunks exist
+    missing_chunks = []
+    manifest['chunks'].times do |i|
+      chunk_file = File.join(DATA_DIR, "clip.#{i.to_s.rjust(4, '0')}.enc")
+      missing_chunks << i unless File.exist?(chunk_file)
+    end
+
+    unless missing_chunks.empty?
+      raise Error, "Missing chunks: #{missing_chunks.join(', ')}"
+    end
+
+    # Read and reassemble chunks
+    encrypted = ""
+    manifest['chunks'].times do |i|
+      chunk_file = File.join(DATA_DIR, "clip.#{i.to_s.rjust(4, '0')}.enc")
+      encrypted << File.binread(chunk_file)
+    end
+
+    # Decrypt
+    decrypted = decrypt(encrypted, key)
+
+    output.write(decrypted)
+    STDERR.puts "✓ Pasted #{decrypted.bytesize} bytes from #{Time.at(manifest['timestamp'])}"
+  rescue Error => e
+    abort "✗ Paste failed: #{e.message}"
+  rescue JSON::ParserError
+    abort "✗ Corrupted manifest file"
+  rescue => e
+    abort "✗ Unexpected error: #{e.message}\n#{e.backtrace.first(3).join("\n")}"
+  end
+
+  def history(limit = 20)
+    pull_from_remote
+
+    raise HistoryError, "Repository not initialized" unless Dir.exist?(REPO_DIR)
+
+    Dir.chdir(REPO_DIR) do
+      # Get git log with commit info
+      log_output = `git log --pretty=format:'%H|%at|%s' -n #{limit} 2>&1`
+
+      if $?.exitstatus != 0
+        raise GitError, "Failed to read git history: #{log_output}"
+      end
+
+      commits = log_output.split("\n").select { |line| line.include?('update clipboard') }
+
+      if commits.empty?
+        STDERR.puts "No clipboard history found"
+        return
+      end
+
+      puts "Clipboard History:"
+      puts "=" * 80
+
+      commits.each_with_index do |line, idx|
+        hash, timestamp, message = line.split('|')
+        short_hash = hash[0, 7]
+        time = Time.at(timestamp.to_i)
+
+        # Try to get preview from that commit
+        preview = get_preview_from_commit(hash)
+
+        puts "[#{idx}] #{time.strftime('%Y-%m-%d %H:%M:%S')} (#{short_hash})"
+        puts "    #{preview}" if preview
+        puts ""
+      end
+
+      puts "Use: pbj <number> to retrieve a specific entry"
+    end
+  rescue Error => e
+    abort "✗ History failed: #{e.message}"
+  rescue => e
+    abort "✗ Unexpected error: #{e.message}"
+  end
+
+  def key_fingerprint(key)
+    # Generate SHA256 fingerprint of encryption key
+    # This allows detecting key mismatches without storing the key
+    require 'digest'
+    Digest::SHA256.hexdigest(key)[0, 16]  # First 16 chars (64 bits)
+  end
+
+  def handle_key_mismatch(manifest)
+    # Someone forked the repo and has different encryption key
+    # Clear the old data since it can't be decrypted
+    STDERR.puts ""
+    STDERR.puts "⚠ KEY MISMATCH DETECTED"
+    STDERR.puts "=" * 60
+    STDERR.puts "The clipboard data was encrypted with a different key."
+    STDERR.puts ""
+    STDERR.puts "This usually happens when you:"
+    STDERR.puts "  1. Forked someone else's repo (contains their data)"
+    STDERR.puts "  2. Cloned on a new device (different key)"
+    STDERR.puts "  3. Deleted your encryption key"
+    STDERR.puts ""
+    STDERR.puts "Data fingerprint: #{manifest['key_fingerprint']}"
+    STDERR.puts "Your fingerprint:  #{key_fingerprint(get_or_create_key)}"
+    STDERR.puts ""
+    STDERR.puts "🗑️  Clearing incompatible data..."
+
+    # Remove data directory contents
+    FileUtils.rm_rf(DATA_DIR)
+    FileUtils.mkdir_p(DATA_DIR)
+
+    # Commit the cleanup
+    Dir.chdir(REPO_DIR) do
+      system("git add data/ >/dev/null 2>&1")
+      system("git commit -m 'clear incompatible clipboard data (key mismatch)' >/dev/null 2>&1")
+      system("git push origin main >/dev/null 2>&1")
+    end
+
+    STDERR.puts "✓ Data cleared. You can now start using pbj with your key."
+    STDERR.puts ""
+  rescue => e
+    STDERR.puts "⚠ Warning: Failed to clear data: #{e.message}"
+  end
+
+  def prompt_pin(prompt_text)
+    # Prompt for PIN with character masking
+    # Returns 4-digit PIN string
+    STDERR.print prompt_text
+    STDERR.flush
+
+    pin = ""
+
+    begin
+      loop do
+        char = STDIN.getch
+
+        case char.ord
+        when 3  # Ctrl-C
+          STDERR.puts
+          raise Interrupt
+        when 13, 10  # Enter (CR or LF)
+          STDERR.puts
+          break
+        when 127, 8  # Backspace (DEL or BS)
+          unless pin.empty?
+            pin.chop!
+            # Move back, print space, move back again (erase the *)
+            STDERR.print "\b \b"
+            STDERR.flush
+          end
+        when 32..126  # Printable characters
+          if pin.length < 4
+            pin << char
+            STDERR.print "*"
+            STDERR.flush
+          end
+        end
+      end
+    rescue IOError, Errno::EBADF
+      # STDIN not available (e.g., piped input)
+      raise Error, "PIN input requires interactive terminal"
+    end
+
+    pin
+  end
+
+  def get_pin_with_confirmation()
+    # Get PIN with confirmation, validate 4-digit numeric
+    loop do
+      pin1 = prompt_pin("Enter 4-digit PIN: ")
+
+      # Validate format
+      unless pin1.match?(/^\d{4}$/)
+        STDERR.puts "✗ PIN must be exactly 4 digits (0-9 only)"
+        STDERR.puts ""
+        next
+      end
+
+      pin2 = prompt_pin("Confirm PIN: ")
+
+      if pin1 == pin2
+        STDERR.puts "✓ PIN confirmed"
+        STDERR.puts ""
+        return pin1
+      else
+        STDERR.puts "✗ PINs do not match. Try again."
+        STDERR.puts ""
+      end
+    end
+  end
+
+  def derive_pin_key(pin)
+    # Derive 32-byte encryption key from PIN + padding
+    # PIN (4 bytes) + PIN_PADDING (28 bytes) = 32 bytes for AES-256
+    raise Error, "PIN must be 4 characters" unless pin.length == 4
+
+    # Convert PIN digits to bytes
+    pin_bytes = pin.bytes
+
+    # Combine with padding to create 32-byte key
+    key = pin_bytes.pack('C*') + PIN_PADDING
+
+    raise Error, "Key derivation failed" unless key.bytesize == 32
+    key
+  end
+
+  def encrypt_key_for_recovery(key, pin)
+    # Encrypt the PBJ_KEY with PIN-derived key for safe logging
+    # Returns base64-encoded: IV (12) + auth_tag (16) + ciphertext
+    derive_key = derive_pin_key(pin)
+
+    cipher = OpenSSL::Cipher.new('aes-256-gcm')
+    cipher.encrypt
+    cipher.key = derive_key
+
+    # Generate random IV
+    iv = cipher.random_iv
+
+    # Encrypt the key
+    ciphertext = cipher.update(key) + cipher.final
+
+    # Get authentication tag
+    auth_tag = cipher.auth_tag
+
+    # Combine: IV + auth_tag + ciphertext
+    encrypted_blob = iv + auth_tag + ciphertext
+
+    # Return as base64
+    [encrypted_blob].pack('m0')
+  end
+
+  def decrypt_key_from_recovery(encrypted_b64, pin)
+    # Decrypt the encrypted key using PIN
+    # Input: base64-encoded IV (12) + auth_tag (16) + ciphertext
+    derive_key = derive_pin_key(pin)
+
+    # Decode from base64
+    encrypted_blob = encrypted_b64.unpack1('m0')
+
+    # Extract components
+    iv = encrypted_blob[0, 12]
+    auth_tag = encrypted_blob[12, 16]
+    ciphertext = encrypted_blob[28..-1]
+
+    raise DecryptionError, "Invalid encrypted blob format" if ciphertext.nil? || ciphertext.empty?
+
+    # Decrypt
+    cipher = OpenSSL::Cipher.new('aes-256-gcm')
+    cipher.decrypt
+    cipher.key = derive_key
+    cipher.iv = iv
+    cipher.auth_tag = auth_tag
+
+    # Decrypt and verify
+    key = cipher.update(ciphertext) + cipher.final
+
+    raise DecryptionError, "Decrypted key has wrong size" unless key.bytesize == 32
+    key
+  rescue OpenSSL::Cipher::CipherError
+    raise DecryptionError, "Decryption failed - wrong PIN or corrupted data"
+  end
+
+  def generate_preview(data)
+    # Generate a preview string (first 100 chars, sanitized)
+    preview = data[0, 100].gsub(/[^[:print:]]/, ' ').strip
+    preview += "..." if data.bytesize > 100
+    preview
+  rescue
+    "<binary data>"
+  end
+
+  def get_preview_from_commit(commit_hash)
+    manifest_at_commit = `git show #{commit_hash}:data/manifest.json 2>/dev/null`
+    return nil if $?.exitstatus != 0
+
+    manifest = JSON.parse(manifest_at_commit)
+    manifest['preview'] || "<no preview>"
+  rescue
+    nil
+  end
+
+  def restore_from_history(index_or_hash)
+    Dir.chdir(REPO_DIR) do
+      # Get the commit hash from index
+      commits = `git log --pretty=format:'%H' 2>&1`.split("\n").select.with_index { |_, i| true }
+      clipboard_commits = []
+
+      commits.each do |hash|
+        msg = `git log -1 --pretty=format:'%s' #{hash}`.strip
+        clipboard_commits << hash if msg.include?('update clipboard')
+      end
+
+      commit_hash = nil
+      if index_or_hash.match?(/^\d+$/)
+        # It's an index
+        idx = index_or_hash.to_i
+        raise HistoryError, "Invalid history index: #{idx}" if idx >= clipboard_commits.size
+        commit_hash = clipboard_commits[idx]
+      else
+        # It's a hash
+        commit_hash = index_or_hash
+      end
+
+      # Restore files from that commit
+      result = system("git checkout #{commit_hash} -- data/ >/dev/null 2>&1")
+      raise GitError, "Failed to restore from history" unless result
+    end
+  end
+
+  def setup_repo
+    # New workflow: Users fork ahoward/pbj and clone anywhere
+    # The repo already exists and contains bin/ with this script!
+    # This should never be called since REPO_DIR is calculated from __FILE__
+
+    raise SetupError, "Repository structure invalid at #{REPO_DIR}\n" \
+                      "Expected structure:\n" \
+                      "  #{REPO_DIR}/\n" \
+                      "  ├── bin/pbj (this script)\n" \
+                      "  ├── data/ (will be created)\n" \
+                      "  └── .git/ (git repository)\n\n" \
+                      "Setup instructions:\n" \
+                      "  1. Fork https://github.com/ahoward/pbj on GitHub\n" \
+                      "  2. Clone your fork: git clone git@github.com:USERNAME/pbj.git LOCATION\n" \
+                      "  3. Add to PATH: export PATH=\"LOCATION/bin:\$PATH\"\n" \
+                      "  4. Run: pbj\n\n" \
+                      "Recommended location: ~/.pbj"
+
+  rescue SetupError => e
+    raise e
+  rescue => e
+    raise SetupError, "Setup failed: #{e.message}"
+  end
+
+  def get_or_create_key
+    # Store key in repo root (gitignored)
+    key_file = File.join(REPO_DIR, '.pbj-key')
+
+    # Try local cache first
+    if File.exist?(key_file)
+      begin
+        return File.binread(key_file).unpack1('m0')
+      rescue => e
+        STDERR.puts "⚠ Corrupted key file, regenerating..."
+        File.delete(key_file)
+      end
+    end
+
+    # Try to fetch from GitHub Secrets (requires workflow trigger)
+    # Note: This requires manual workflow run for recovery
+    # Primary method: copy .pbj-key file manually between devices
+
+    # Generate new key
+    new_key = OpenSSL::Random.random_bytes(32)
+    key_b64 = [new_key].pack('m0')
+
+    # Store locally
+    File.write(key_file, key_b64)
+    File.chmod(0600, key_file)
+
+    # Store in GitHub Secrets (secure but not directly readable)
+    begin
+      username = `gh api user -q .login 2>/dev/null`.strip
+      if !username.empty?
+        full_repo_name = "#{username}/#{REPO_NAME}"
+
+        # Check if repo exists
+        repo_exists = system("gh repo view #{full_repo_name} > /dev/null 2>&1")
+
+        if repo_exists
+          # Try to enable Actions
+          ensure_actions_enabled(full_repo_name)
+
+          # Store as GitHub Secret
+          IO.popen("gh secret set #{SECRET_NAME} -R #{full_repo_name} 2>&1", 'w') do |io|
+            io.puts key_b64
+          end
+
+          if $?.exitstatus == 0
+            STDERR.puts "✓ Key backed up to GitHub Secrets"
+            STDERR.puts "   Multi-device: Copy .pbj-key manually or use 'gh workflow run key-recovery.yml'"
+          else
+            STDERR.puts "⚠ Warning: Could not store key in GitHub Secrets"
+            STDERR.puts "   Multi-device: Copy ~/.pbj/.pbj-key manually"
+          end
+        else
+          STDERR.puts "⚠ Note: GitHub repo not found."
+        end
+      end
+    rescue => e
+      STDERR.puts "⚠ Warning: Could not access GitHub: #{e.message}"
+    end
+
+    STDERR.puts "✓ Created new encryption key"
+
+    # Prompt for PIN for enhanced key recovery security
+    STDERR.puts ""
+    STDERR.puts "🔐 PIN Setup for Key Recovery"
+    STDERR.puts "=" * 60
+    STDERR.puts "Set a 4-digit PIN to protect your key during recovery."
+    STDERR.puts "This PIN encrypts your key in workflow logs."
+    STDERR.puts "⚠  You'll need this PIN to recover your key on new devices."
+    STDERR.puts "=" * 60
+    STDERR.puts ""
+
+    pin = get_pin_with_confirmation()
+
+    # Store PIN in GitHub Secrets
+    if !username.empty? && repo_exists
+      IO.popen("gh secret set #{PIN_SECRET_NAME} -R #{full_repo_name} 2>&1", 'w') do |io|
+        io.puts pin
+      end
+
+      if $?.exitstatus == 0
+        STDERR.puts "✓ PIN backed up to GitHub Secrets"
+        STDERR.puts "   For recovery: Run 'pbj recover' and enter your PIN"
+      else
+        STDERR.puts "⚠ Warning: Could not store PIN in GitHub Secrets"
+      end
+    end
+
+    new_key
+  rescue => e
+    raise EncryptionError, "Key management failed: #{e.message}"
+  end
+
+  def ensure_actions_enabled(repo_name)
+    # Try to enable Actions via API
+    # Check current permissions
+    perms = `gh api repos/#{repo_name}/actions/permissions 2>/dev/null`.strip
+
+    if perms.empty? || perms.include?('disabled')
+      # Try to enable Actions (may fail if user doesn't have permissions)
+      # Set to allow all actions
+      enable_cmd = <<~JSON
+        {
+          "enabled": true,
+          "allowed_actions": "all"
+        }
+      JSON
+
+      system("gh api -X PUT repos/#{repo_name}/actions/permissions --input - <<< '#{enable_cmd}' 2>/dev/null")
+    end
+  rescue
+    # Silently fail - not critical
+  end
+
+
+  def encrypt(data, key)
+    cipher = OpenSSL::Cipher.new('AES-256-GCM')
+    cipher.encrypt
+    cipher.key = key
+    iv = cipher.random_iv
+
+    encrypted = cipher.update(data) + cipher.final
+    auth_tag = cipher.auth_tag
+
+    # Return: IV (12 bytes) + auth_tag (16 bytes) + encrypted data
+    iv + auth_tag + encrypted
+  rescue => e
+    raise EncryptionError, "Encryption failed: #{e.message}"
+  end
+
+  def decrypt(encrypted_data, key)
+    raise DecryptionError, "Invalid encrypted data" if encrypted_data.bytesize < 28
+
+    iv = encrypted_data[0, 12]
+    auth_tag = encrypted_data[12, 16]
+    ciphertext = encrypted_data[28..-1]
+
+    decipher = OpenSSL::Cipher.new('AES-256-GCM')
+    decipher.decrypt
+    decipher.key = key
+    decipher.iv = iv
+    decipher.auth_tag = auth_tag
+
+    decipher.update(ciphertext) + decipher.final
+  rescue OpenSSL::Cipher::CipherError => e
+    raise DecryptionError, "Decryption failed (wrong key or corrupted data): #{e.message}"
+  rescue => e
+    raise DecryptionError, "Decryption failed: #{e.message}"
+  end
+
+  def chunk_data(data)
+    chunks = []
+    offset = 0
+
+    while offset < data.bytesize
+      chunks << data[offset, CHUNK_SIZE]
+      offset += CHUNK_SIZE
+    end
+
+    chunks
+  end
+
+  def cleanup_old_chunks
+    Dir.glob(File.join(DATA_DIR, 'clip.*.enc')).each { |f| File.delete(f) }
+  rescue => e
+    STDERR.puts "⚠ Warning: Failed to cleanup old chunks: #{e.message}"
+  end
+
+  def sync_to_remote(message)
+    Dir.chdir(REPO_DIR) do
+      system("git add data/ >/dev/null 2>&1")
+      system("git commit -m '#{message}' >/dev/null 2>&1")
+
+      # Background push for speed
+      pid = fork do
+        exec("git push origin main >/dev/null 2>&1")
+      end
+      Process.detach(pid) if pid
+    end
+  rescue => e
+    STDERR.puts "⚠ Warning: Failed to sync to remote: #{e.message}"
+  end
+
+  def pull_from_remote
+    Dir.chdir(REPO_DIR) do
+      # Quick pull with rebase (silence all output)
+      result = system("git pull --rebase origin main >/dev/null 2>&1")
+      unless result
+        # Try to recover from rebase conflicts
+        system("git rebase --abort >/dev/null 2>&1")
+        system("git reset --hard origin/main >/dev/null 2>&1")
+      end
+    end
+  rescue => e
+    STDERR.puts "⚠ Warning: Failed to pull from remote: #{e.message}"
+  end
+
+  def get_repo_size_mb
+    Dir.chdir(REPO_DIR) do
+      size_kb = `du -sk .git 2>/dev/null | cut -f1`.strip.to_i
+      (size_kb / 1024.0).round(2)
+    end
+  rescue
+    0
+  end
+
+  def background_prune_check
+    # Fork a background process to check size and prune if needed
+    # This way the user's copy operation returns immediately
+    pid = fork do
+      begin
+        # Give the background push time to complete
+        sleep 2
+
+        size_mb = get_repo_size_mb
+        exit if size_mb == 0  # Use exit, not return in fork
+
+        if size_mb >= AUTO_PRUNE_THRESHOLD_MB
+          # Write to a log file since STDERR won't be visible
+          log_file = File.join(REPO_DIR, 'prune.log')
+          File.open(log_file, 'a') do |f|
+            f.puts "[#{Time.now}] Auto-pruning triggered (size: #{size_mb}MB)"
+          end
+
+          prune_history
+
+          File.open(log_file, 'a') do |f|
+            f.puts "[#{Time.now}] Auto-pruning completed"
+          end
+        elsif size_mb >= REPO_SIZE_WARNING_MB
+          # Just log the warning, don't bother the user
+          log_file = File.join(REPO_DIR, 'prune.log')
+          File.open(log_file, 'a') do |f|
+            f.puts "[#{Time.now}] Warning: Repository size #{size_mb}MB (threshold: #{REPO_SIZE_WARNING_MB}MB)"
+          end
+        end
+      rescue => e
+        # Silently fail in background
+        log_file = File.join(REPO_DIR, 'prune.log')
+        File.open(log_file, 'a') do |f|
+          f.puts "[#{Time.now}] Background prune check failed: #{e.message}"
+        end
+      end
+    end
+    Process.detach(pid) if pid
+  rescue => e
+    # If fork fails, just continue (non-fatal)
+  end
+
+  def background_key_backup(key)
+    # Background task: sync encryption key to GitHub Secrets
+    # Ensures key is always backed up and up-to-date
+    pid = fork do
+      begin
+        # Redirect all output to /dev/null to prevent polluting STDOUT/STDERR
+        $stdout.reopen('/dev/null', 'w')
+        $stderr.reopen('/dev/null', 'w')
+
+        # Get repo name
+        username = `gh api user --jq .login 2>/dev/null`.strip
+        exit if username.empty?
+
+        full_repo_name = "#{username}/#{REPO_NAME}"
+
+        # Encode key as base64
+        key_b64 = [key].pack('m0')
+
+        # Store in GitHub Secrets (write-only, secure)
+        # All output suppressed by redirecting stdout/stderr above
+        IO.popen("gh secret set #{SECRET_NAME} -R #{full_repo_name} 2>&1", 'w') do |io|
+          io.puts key_b64
+        end
+      rescue => e
+        # Silently fail in background (non-fatal)
+        # Can't log to stderr since it's redirected, so use file
+        log_file = File.join(REPO_DIR, 'prune.log')
+        File.open(log_file, 'a') do |f|
+          f.puts "[#{Time.now}] Background key backup failed: #{e.message}"
+        end
+      end
+    end
+    Process.detach(pid) if pid
+  rescue => e
+    # If fork fails, just continue (non-fatal)
+  end
+
+  def check_repo_size
+    # Interactive version (for manual commands like 'pbj info')
+    size_mb = get_repo_size_mb
+    return if size_mb == 0
+
+    if size_mb >= AUTO_PRUNE_THRESHOLD_MB
+      STDERR.puts "⚠ Repository size (#{size_mb}MB) exceeds auto-prune threshold"
+      STDERR.puts "🔧 Auto-pruning to last #{MAX_HISTORY_COMMITS} entries..."
+      prune_history
+    elsif size_mb >= REPO_SIZE_WARNING_MB
+      STDERR.puts "⚠ Repository size: #{size_mb}MB (warning threshold: #{REPO_SIZE_WARNING_MB}MB)"
+      STDERR.puts "💡 Run 'pbj info' for details or 'pbj prune' to clean up"
+    end
+  rescue => e
+    # Non-fatal, just warn
+    STDERR.puts "⚠ Warning: Could not check repository size: #{e.message}"
+  end
+
+  def prune_history(keep_last = MAX_HISTORY_COMMITS)
+    raise HistoryError, "Repository not initialized" unless Dir.exist?(REPO_DIR)
+
+    Dir.chdir(REPO_DIR) do
+      # Get all clipboard commits
+      all_commits = `git log --pretty=format:'%H' 2>&1`.split("\n")
+      clipboard_commits = all_commits.select do |hash|
+        msg = `git log -1 --pretty=format:'%s' #{hash}`.strip
+        msg.include?('update clipboard')
+      end
+
+      if clipboard_commits.size <= keep_last
+        STDERR.puts "✓ History has #{clipboard_commits.size} entries (within limit of #{keep_last})"
+        return
+      end
+
+      # Find the commit to keep (the Nth clipboard commit)
+      cutoff_commit = clipboard_commits[keep_last - 1]
+
+      STDERR.puts "Pruning history to last #{keep_last} entries..."
+      STDERR.puts "Current history: #{clipboard_commits.size} entries"
+
+      # Create orphan branch from cutoff point
+      system("git checkout --orphan temp_branch #{cutoff_commit} >/dev/null 2>&1")
+      system("git commit -m 'pruned history - keeping last #{keep_last} entries' >/dev/null 2>&1")
+
+      # Replace main branch
+      system("git branch -D main >/dev/null 2>&1")
+      system("git branch -m main >/dev/null 2>&1")
+
+      # Force push (THIS REWRITES HISTORY!)
+      system("git push -f origin main >/dev/null 2>&1")
+
+      # Cleanup
+      system("git gc --aggressive --prune=now >/dev/null 2>&1")
+      system("git reflog expire --expire=now --all >/dev/null 2>&1")
+
+      new_size = get_repo_size_mb
+      STDERR.puts "✓ Pruned history. Repo size: #{new_size}MB"
+    end
+  rescue => e
+    abort "✗ Prune failed: #{e.message}"
+  end
+
+  def show_repo_info
+    raise Error, "Repository not initialized" unless Dir.exist?(REPO_DIR)
+
+    Dir.chdir(REPO_DIR) do
+      total_commits = `git rev-list --count HEAD 2>/dev/null`.strip.to_i
+      clipboard_commits = `git log --grep='update clipboard' --oneline 2>/dev/null | wc -l`.strip.to_i
+      repo_size = get_repo_size_mb
+      oldest = `git log --reverse --pretty=format:'%at' --max-count=1 2>/dev/null`.strip
+      newest = `git log --pretty=format:'%at' --max-count=1 2>/dev/null`.strip
+
+      puts "Repository Info:"
+      puts "=" * 60
+      puts "Location:          #{REPO_DIR}"
+      puts "Total commits:     #{total_commits}"
+      puts "Clipboard entries: #{clipboard_commits}"
+      puts "Repository size:   #{repo_size}MB"
+      puts "Oldest entry:      #{Time.at(oldest.to_i).strftime('%Y-%m-%d %H:%M:%S')}" unless oldest.empty?
+      puts "Newest entry:      #{Time.at(newest.to_i).strftime('%Y-%m-%d %H:%M:%S')}" unless newest.empty?
+      puts ""
+      puts "Limits:"
+      puts "  Max history:     #{MAX_HISTORY_COMMITS} entries"
+      puts "  Warning at:      #{REPO_SIZE_WARNING_MB}MB"
+      puts "  Auto-prune at:   #{AUTO_PRUNE_THRESHOLD_MB}MB"
+
+      if clipboard_commits > MAX_HISTORY_COMMITS
+        puts ""
+        puts "⚠ History exceeds limit. Run 'pbj prune' to clean up."
+      end
+
+      if repo_size > REPO_SIZE_WARNING_MB
+        puts ""
+        puts "⚠ Repository size is large. Consider running 'pbj prune'."
+      end
+    end
+  rescue => e
+    abort "✗ Info failed: #{e.message}"
+  end
+
+  def set_pin
+    # Set or update PIN for existing key
+    STDERR.puts "🔐 Set Recovery PIN"
+    STDERR.puts "=" * 60
+    STDERR.puts ""
+
+    key_file = File.join(REPO_DIR, '.pbj-key')
+
+    # Check if key exists
+    unless File.exist?(key_file)
+      raise Error, "No encryption key found. Create one first by copying something:\n  echo 'test' | pbj"
+    end
+
+    # Get username and repo
+    STDERR.puts "Checking GitHub authentication..."
+    username = `gh api user -q .login 2>/dev/null`.strip
+    if username.empty?
+      raise Error, "Not authenticated with gh CLI. Run: gh auth login"
+    end
+    full_repo_name = "#{username}/#{REPO_NAME}"
+    STDERR.puts "✓ Authenticated as #{username}"
+    STDERR.puts ""
+
+    # Check if repo exists
+    repo_exists = system("gh repo view #{full_repo_name} > /dev/null 2>&1")
+    unless repo_exists
+      raise Error, "Repository #{full_repo_name} not found"
+    end
+
+    # Prompt for PIN
+    STDERR.puts "Set a 4-digit PIN to protect your key during recovery."
+    STDERR.puts "This PIN encrypts your key in workflow logs."
+    STDERR.puts ""
+
+    pin = get_pin_with_confirmation()
+
+    # Store PIN in GitHub Secrets
+    IO.popen("gh secret set #{PIN_SECRET_NAME} -R #{full_repo_name} 2>&1", 'w') do |io|
+      io.puts pin
+    end
+
+    if $?.exitstatus == 0
+      STDERR.puts "✓ PIN saved to GitHub Secrets"
+      STDERR.puts "   For recovery: Run 'pbj recover' and enter your PIN"
+      STDERR.puts ""
+      STDERR.puts "=" * 60
+      STDERR.puts "⚠  Remember your PIN! It cannot be recovered."
+      STDERR.puts "=" * 60
+    else
+      raise Error, "Failed to store PIN in GitHub Secrets"
+    end
+
+  rescue Error => e
+    abort "✗ Set PIN failed: #{e.message}"
+  rescue => e
+    abort "✗ Unexpected error: #{e.message}\n#{e.backtrace.first(3).join("\n")}"
+  end
+
+  def recover_key
+    # Recover encryption key from GitHub Secrets via workflow
+    STDERR.puts "🔑 Key Recovery"
+    STDERR.puts "=" * 60
+    STDERR.puts ""
+
+    key_file = File.join(REPO_DIR, '.pbj-key')
+    backup_file = "#{key_file}.bak"
+
+    # Check if key already exists
+    will_backup = false
+    if File.exist?(key_file)
+      STDERR.puts "⚠ Key file already exists at #{key_file}"
+      STDERR.print "Overwrite? [y/N] "
+      answer = STDIN.gets.strip.downcase
+      unless answer == 'y' || answer == 'yes'
+        STDERR.puts "Aborted."
+        return
+      end
+      will_backup = true
+      STDERR.puts ""
+    end
+
+    # Get username and repo
+    STDERR.puts "Checking GitHub authentication..."
+    username = `gh api user -q .login 2>/dev/null`.strip
+    if username.empty?
+      raise Error, "Not authenticated with gh CLI. Run: gh auth login"
+    end
+    full_repo_name = "#{username}/#{REPO_NAME}"
+    STDERR.puts "✓ Authenticated as #{username}"
+    STDERR.puts ""
+
+    # Trigger the workflow
+    STDERR.puts "Triggering key-recovery workflow..."
+    result = system("gh workflow run key-recovery.yml -R #{full_repo_name} >/dev/null 2>&1")
+    unless result
+      raise Error, "Failed to trigger workflow. Make sure the key-recovery.yml workflow exists."
+    end
+    STDERR.puts "✓ Workflow triggered"
+    STDERR.puts ""
+
+    # Poll for workflow completion
+    STDERR.puts "Waiting for workflow to complete..."
+    STDERR.puts "(This may take 30-60 seconds)"
+    STDERR.puts ""
+
+    run_id = nil
+    max_attempts = 30
+    attempt = 0
+
+    # Wait for run to appear (can take a few seconds)
+    while run_id.nil? && attempt < max_attempts
+      sleep 2
+      attempt += 1
+      STDERR.print "."
+
+      runs = `gh run list --workflow=key-recovery.yml -R #{full_repo_name} --limit 1 --json databaseId,status,conclusion 2>/dev/null`
+      next if runs.empty?
+
+      begin
+        require 'json'
+        parsed = JSON.parse(runs)
+        if parsed.is_a?(Array) && parsed.size > 0
+          run_id = parsed[0]['databaseId']
+        end
+      rescue
+        # Keep polling
+      end
+    end
+
+    STDERR.puts ""
+
+    if run_id.nil?
+      raise Error, "Workflow did not start. Check GitHub Actions status."
+    end
+
+    STDERR.puts "✓ Workflow started (run ID: #{run_id})"
+    STDERR.puts ""
+
+    # Poll until completed
+    completed = false
+    attempt = 0
+    max_attempts = 60
+
+    while !completed && attempt < max_attempts
+      sleep 2
+      attempt += 1
+
+      run_info = `gh run view #{run_id} -R #{full_repo_name} --json status,conclusion 2>/dev/null`
+      next if run_info.empty?
+
+      begin
+        parsed = JSON.parse(run_info)
+        status = parsed['status']
+        conclusion = parsed['conclusion']
+
+        if status == 'completed'
+          completed = true
+          if conclusion != 'success'
+            raise Error, "Workflow failed with status: #{conclusion}"
+          end
+        else
+          STDERR.print "."
+        end
+      rescue JSON::ParserError
+        # Keep polling
+      end
+    end
+
+    STDERR.puts ""
+
+    unless completed
+      raise Error, "Workflow timed out. Check manually: gh run view #{run_id} -R #{full_repo_name}"
+    end
+
+    STDERR.puts "✓ Workflow completed successfully"
+    STDERR.puts ""
+
+    # Get the logs and extract the key
+    STDERR.puts "Extracting key from workflow logs..."
+    logs = `gh run view #{run_id} -R #{full_repo_name} --log 2>/dev/null`
+
+    # Try to parse JSON output first (most reliable)
+    encrypted_b64 = nil
+    # Match JSON on the line after "JSON Output (for automated parsing):"
+    if logs =~ /JSON Output \(for automated parsing\):\s*\n.*?(\{.*?"encrypted_key".*?\})/m
+      json_str = $1
+      begin
+        require 'json'
+        data = JSON.parse(json_str)
+        encrypted_b64 = data['encrypted_key']
+        STDERR.puts "✓ Found encrypted key (JSON format)"
+        STDERR.puts ""
+      rescue => e
+        STDERR.puts "⚠ JSON parse failed: #{e.message}, falling back to text parsing"
+        # Fall through to text parsing
+      end
+    end
+
+    # Fall back to text parsing if JSON not found
+    if encrypted_b64.nil?
+      # Check for new format (PIN-encrypted) vs old format (raw key)
+      # Note: The base64 may be split across multiple lines in logs, so we match and then clean it
+      encrypted_match = logs.match(/Encrypted key \(requires PIN to decrypt\):\s*([A-Za-z0-9+\/=\s]+)/)
+
+      if encrypted_match
+        # Remove all whitespace (newlines, spaces) from the base64 string
+        encrypted_b64 = encrypted_match[1].gsub(/\s+/, '')
+        STDERR.puts "✓ Found encrypted key (text format)"
+        STDERR.puts ""
+      end
+    end
+
+    raw_key_match = logs.match(/Your encryption key \(base64 encoded\):\s*([A-Za-z0-9+\/=\s]+)/)
+
+    key = nil
+
+    if encrypted_b64
+
+      # Prompt for PIN with retry logic
+      max_attempts = 3
+      attempt = 0
+
+      while attempt < max_attempts
+        attempt += 1
+
+        pin = prompt_pin("Enter your PIN: ")
+
+        begin
+          key = decrypt_key_from_recovery(encrypted_b64, pin)
+          STDERR.puts "✓ Key decrypted successfully"
+          break
+        rescue DecryptionError => e
+          if attempt < max_attempts
+            STDERR.puts "✗ #{e.message}"
+            STDERR.puts "   Try again (#{max_attempts - attempt} attempts remaining)"
+            STDERR.puts ""
+          else
+            raise Error, "Failed to decrypt key after #{max_attempts} attempts. Wrong PIN?"
+          end
+        end
+      end
+
+      unless key
+        raise Error, "Could not decrypt key"
+      end
+
+    elsif raw_key_match
+      # Old format: raw key (backward compatibility)
+      STDERR.puts "⚠  Warning: Using legacy unencrypted recovery format"
+      STDERR.puts "   Consider running 'pbj set-pin' for enhanced security"
+      STDERR.puts ""
+
+      key_b64 = raw_key_match[1].strip
+
+      begin
+        key = key_b64.unpack1('m0')
+        if key.bytesize != 32
+          raise Error, "Invalid key size: #{key.bytesize} bytes (expected 32)"
+        end
+      rescue
+        raise Error, "Invalid base64 key format"
+      end
+
+    else
+      raise Error, "Could not find key in workflow logs. Check manually: gh run view #{run_id} -R #{full_repo_name} --log"
+    end
+
+    # Backup existing key if needed
+    if will_backup
+      FileUtils.cp(key_file, backup_file)
+      File.chmod(0600, backup_file)
+      STDERR.puts "✓ Backed up existing key to #{backup_file}"
+    end
+
+    # Save the key
+    File.write(key_file, key_b64)
+    File.chmod(0600, key_file)
+    STDERR.puts "✓ Key saved to #{key_file}"
+    STDERR.puts ""
+
+    # Remind user to delete the workflow run
+    STDERR.puts "=" * 60
+    STDERR.puts "⚠  SECURITY REMINDER"
+    STDERR.puts "=" * 60
+    STDERR.puts "The workflow run contains your key in the logs!"
+    STDERR.puts "Delete it now:"
+    STDERR.puts ""
+    STDERR.puts "  gh run delete #{run_id} -R #{full_repo_name}"
+    STDERR.puts ""
+    STDERR.puts "Or via GitHub web:"
+    STDERR.puts "  Settings → Actions → Workflow runs → Delete run ##{run_id}"
+    STDERR.puts "=" * 60
+
+  rescue Error => e
+    abort "✗ Key recovery failed: #{e.message}"
+  rescue => e
+    abort "✗ Unexpected error: #{e.message}\n#{e.backtrace.first(3).join("\n")}"
+  end
+
+  def show_usage
+    puts <<~USAGE
+      pbj - the universal paste buffer
+
+      Usage:
+        echo "data" | pbj           # copy to clipboard
+        pbj                         # paste from clipboard
+        pbj history [limit]         # show clipboard history (default: 20)
+        pbj <number>                # paste from history by index
+        pbj info                    # show repository info & size
+        pbj prune [keep]            # prune history (default: keep last 108)
+        pbj set-pin                 # set/update recovery PIN
+        pbj recover                 # recover encryption key from GitHub Secrets
+        pbj help                    # show this help
+
+      Examples:
+        cat file.txt | pbj          # copy file
+        pbj > output.txt            # paste to file
+        pbj history                 # list history
+        pbj 0                       # paste most recent
+        pbj 5                       # paste 6th entry
+        pbj info                    # check repo size
+        pbj prune                   # keep last 108 entries
+        pbj prune 50                # keep last 50 entries
+        pbj set-pin                 # set recovery PIN
+        pbj recover                 # recover key on new device
+
+      History Management:
+        - History stored in git commits (time-travel your clipboard!)
+        - Automatic pruning at #{AUTO_PRUNE_THRESHOLD_MB}MB
+        - Manual pruning: 'pbj prune'
+        - Check size: 'pbj info'
+
+      PIN-Protected Key Recovery:
+        - Set PIN on first copy (or use 'pbj set-pin')
+        - PIN encrypts key in workflow logs for security
+        - Primary: Copy ~/.pbj/.pbj-key manually (fastest)
+        - Backup: 'pbj recover' (requires PIN)
+        - Key + PIN auto-backed up to GitHub Secrets
+    USAGE
+  end
+end
+
+# Main execution
+if __FILE__ == $0
+  begin
+    pbj = PBJ.new
+
+    # Parse command line arguments
+    arg = ARGV[0]
+
+    # Internal command for GitHub Actions workflow
+    if arg == '__internal_encrypt_for_recovery__'
+      # This command is called by the key-recovery workflow
+      # It encrypts PBJ_KEY with PBJ_PIN for safe logging
+      key_b64 = ENV['PBJ_KEY']
+      pin = ENV['PBJ_PIN']
+
+      unless key_b64 && pin
+        STDERR.puts "✗ Error: PBJ_KEY and PBJ_PIN environment variables required"
+        exit 1
+      end
+
+      begin
+        # Decode key from base64
+        key = key_b64.unpack1('m0')
+
+        # Encrypt with PIN
+        encrypted_blob = pbj.encrypt_key_for_recovery(key, pin)
+
+        # Output encrypted blob as JSON for reliable parsing
+        require 'json'
+        output = {
+          "encrypted_key" => encrypted_blob,
+          "format" => "pin-protected",
+          "instructions" => "Run 'pbj recover' and enter your PIN"
+        }
+
+        puts ""
+        puts "============================================"
+        puts "PBJ Encryption Key Recovery"
+        puts "============================================"
+        puts ""
+        puts "JSON Output (for automated parsing):"
+        puts JSON.generate(output)
+        puts ""
+        puts "Encrypted key (requires PIN to decrypt):"
+        puts encrypted_blob
+        puts ""
+        puts "To decrypt on your device:"
+        puts "  pbj recover"
+        puts "  (You will be prompted for your PIN)"
+        puts ""
+        puts "============================================"
+      rescue => e
+        STDERR.puts "✗ Encryption failed: #{e.message}"
+        exit 1
+      end
+
+      exit 0
+    elsif arg == 'help' || arg == '--help' || arg == '-h'
+      pbj.show_usage
+    elsif arg == 'history'
+      limit = ARGV[1]&.to_i || 20
+      pbj.history(limit)
+    elsif arg == 'info'
+      pbj.show_repo_info
+    elsif arg == 'prune'
+      keep = ARGV[1]&.to_i || PBJ::MAX_HISTORY_COMMITS
+      pbj.prune_history(keep)
+    elsif arg == 'set-pin'
+      pbj.set_pin
+    elsif arg == 'recover'
+      pbj.recover_key
+    elsif arg =~ /^\d+$/
+      # Paste from history
+      pbj.paste(STDOUT, arg)
+    elsif arg.nil?
+      # No arguments
+      if STDIN.tty?
+        # Read mode (paste)
+        pbj.paste
+      else
+        # Write mode (copy)
+        pbj.copy
+      end
+    else
+      STDERR.puts "✗ Unknown command: #{arg}"
+      STDERR.puts "Run 'pbj help' for usage information"
+      exit 1
+    end
+  rescue Interrupt
+    STDERR.puts "\n✗ Interrupted"
+    exit 130
+  rescue Errno::EPIPE
+    # Broken pipe (e.g., piped to head), exit gracefully
+    exit 0
+  rescue => e
+    STDERR.puts "✗ Fatal error: #{e.message}"
+    exit 1
+  end
+end

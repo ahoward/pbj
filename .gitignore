@@ -1,0 +1,9 @@
+# Pruning logs (local only)
+prune.log
+
+# Encryption key cache (local only, backed up in GitHub Secrets)
+.pbj-key
+.pbj-key.bak
+
+# Note: data/ is NOT ignored - it contains encrypted clipboard data that syncs!
+# The whole point is to sync clipboard data across devices via git.
