@@ -448,9 +448,17 @@ class PBJ
     # Try local cache first
     if File.exist?(key_file)
       begin
-        return File.binread(key_file).unpack1('m0')
+        key_b64 = File.binread(key_file)
+        key = key_b64.unpack1('m0')
+
+        # Validate key size
+        if key.bytesize != 32
+          raise Error, "Invalid key size: #{key.bytesize} (expected 32)"
+        end
+
+        return key
       rescue => e
-        STDERR.puts "⚠ Corrupted key file, regenerating..."
+        STDERR.puts "⚠ Corrupted key file (#{e.message}), regenerating..."
         File.delete(key_file)
       end
     end
