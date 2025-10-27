@@ -448,7 +448,8 @@ class PBJ
     # Try local cache first
     if File.exist?(key_file)
       begin
-        key_b64 = File.binread(key_file)
+        # Read and strip whitespace (handles newlines from echo, etc.)
+        key_b64 = File.binread(key_file).strip
         key = key_b64.unpack1('m0')
 
         # Validate key size
